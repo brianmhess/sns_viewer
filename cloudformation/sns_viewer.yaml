@@ -1,0 +1,666 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  prefix:
+    Description: Prefix name to be prepended for resources (lowercase, numbers, and hyphen). (Can be the same as StackName)
+    Type: String
+    Default: voc
+    AllowedPattern: "^[a-z0-9-]+$"
+  S3SourceBucket:
+    Description: Bucket for the webpage source zip file
+    Type: String
+  S3SourceKey:
+    Description: Object key for the webpage source zip file
+    Type: String
+  SNSTopic:
+    Description: SNS Topic Arn to subscribe to
+    Type: String
+    AllowedPattern: "arn:aws:sns:.*"
+
+Resources:
+  IoTThing:
+    Type: "AWS::IoT::Thing"
+    Properties:
+      ThingName: !Sub ${prefix}-iot-snsviewer
+      AttributePayload:
+        Attributes: {}
+
+  IoTEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Create thing, certificate, and policy, return cert and private key
+      Handler: index.handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import sys
+          import cfnresponse
+          import boto3
+          from botocore.exceptions import ClientError
+          import json
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              responseData = {}
+              try:
+                  logger.info('Received event: {}'.format(json.dumps(event)))
+                  result = cfnresponse.FAILED
+                  client = boto3.client('iot')
+                  if event['RequestType'] == 'Create':
+                      logger.info('Creating...')
+                      result = cfnresponse.SUCCESS
+                      responseData['iotEndpoint'] = client.describe_endpoint(endpointType='iot:Data-ATS')['endpointAddress']
+                  elif event['RequestType'] == 'Update':
+                      logger.info('Updating...')
+                      result = cfnresponse.SUCCESS
+                  elif event['RequestType'] == 'Delete':
+                      logger.info('Deleting...')
+                      result = cfnresponse.SUCCESS
+              except ClientError as e:
+                  logger.error('Error: {}'.format(e))
+                  result = cfnresponse.FAILED
+              logger.info('Returning response of: {}, with result of: {}'.format(result, responseData))
+              sys.stdout.flush()
+              cfnresponse.send(event, context, result, responseData)
+
+  IotEndpoint:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt IoTEndpointFunction.Arn
+
+  UserPool:
+    Type: "AWS::Cognito::UserPool"
+    Properties:
+      UserPoolName: !Sub ${prefix}-UserPool
+      MfaConfiguration: "OFF"
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+
+  # Creates a User Pool Client to be used by the identity pool
+  UserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      ClientName: !Sub ${prefix}-PoolClient
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+
+  # Creates a federated Identity pool
+  IdentityPool:
+    Type: "AWS::Cognito::IdentityPool"
+    Properties:
+      IdentityPoolName: !Sub ${prefix}-IdentityPool
+      AllowUnauthenticatedIdentities: true
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # Create a role for unauthorized access to AWS resources.
+  CognitoUnAuthorizedRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Policies:
+        - PolicyName: "CognitoUnauthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "cognito-sync:*"
+                Resource: !Join [ "", [ "arn:aws:cognito-sync:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":identitypool/", !Ref IdentityPool] ]
+              - Effect: Allow
+                Action:
+                  - iot:Connect
+                Resource: !Join [ "", [ "arn:aws:iot:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":client/happyPath-*" ] ]
+              - Effect: Allow
+                Action:
+                  - iot:Subscribe
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iot:Receive
+                Resource: !Join [ "", [ "arn:aws:iot:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":topic/*" ] ]
+
+  # Create a role for authorized acces to AWS resources.
+  CognitoAuthorizedRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: "CognitoAuthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "cognito-sync:*"
+                Resource: !Join [ "", [ "arn:aws:cognito-sync:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":identitypool/", !Ref IdentityPool] ]
+              - Effect: Allow
+                Action:
+                  - iot:Connect
+                Resource: !Join [ "", [ "arn:aws:iot:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":client/happyPath-*" ] ]
+              - Effect: Allow
+                Action:
+                  - iot:Subscribe
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iot:Receive
+                Resource: !Join [ "", [ "arn:aws:iot:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":topic/*" ] ]
+  # Assigns the roles to the Identity Pool
+  IdentityPoolRoleMapping:
+    Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+        unauthenticated: !GetAtt CognitoUnAuthorizedRole.Arn
+
+
+  S3Webpage:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+
+  S3WebpageEmptyAction:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt LambdaS3Empty.Arn
+      BucketName: !Ref S3Webpage
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${prefix}-role-lambdas3empty
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSIoTFullAccess
+      Policies:
+      - PolicyName: s3_readwrite_outputbucket
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:*
+            Resource:
+            - !GetAtt S3Webpage.Arn
+            - !Join
+              - ''
+              - - !GetAtt S3Webpage.Arn
+                - '/*'
+            - !GetAtt S3CodePipeline.Arn
+            - !Join
+              - ''
+              - - !GetAtt S3CodePipeline.Arn
+                - '/*'
+
+  LambdaS3Empty:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          logger.info("delete obj: {}".format(obj))
+                          s3.Object(bucket.name, obj.key).delete()
+
+                  sendResponseCfn(event, context, cfnresponse.SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  sendResponseCfn(event, context, cfnresponse.FAILED)
+
+          def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+
+      Handler: "index.lambda_handler"
+      Runtime: python3.7
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  CFOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub CF OAI for ${prefix} app
+
+  CFAOIBucketAccess:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Webpage
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Resource: !Join [ "", [ "arn:aws:s3:::", !Ref S3Webpage, "/*" ] ]
+            Principal:
+              CanonicalUser: !GetAtt CFOAI.S3CanonicalUserId
+
+  CFDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - CodePipeline
+      - CFOAI
+      - CFAOIBucketAccess
+    Properties:
+      DistributionConfig:
+        Comment: !Sub CloudFront distribution for ${prefix}
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - DomainName: !GetAtt S3Webpage.RegionalDomainName
+            Id: !Sub ${prefix}-origin1
+            OriginPath: /webpage
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CFOAI}
+        Enabled: True
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub ${prefix}-origin1
+          ViewerProtocolPolicy: allow-all
+          ForwardedValues:
+            QueryString: false
+
+  S3CodePipeline:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: Private
+
+  S3CodePipelineEmptyAction:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt LambdaS3Empty.Arn
+      BucketName: !Ref S3CodePipeline
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${prefix}-CodeBuildServiceRole
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  CodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${prefix}-codebuildpolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*:*
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+            Resource: !Join ['', [!GetAtt S3CodePipeline.Arn, '/*']]
+          - Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:BatchPutCodeCoverages
+            Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/*
+      Roles:
+        - !Ref CodeBuildServiceRole
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${prefix}-codebuild
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Join
+        - ''
+        -
+          - "version: 0.2\n"
+          - "phases:\n"
+          - "  pre_build:\n"
+          - "    commands:\n"
+          - "      - npm install\n"
+          - "  build:\n"
+          - "    commands:\n"
+          - "      - VUE_APP_POOLID="
+          - !Ref IdentityPool
+          - " VUE_APP_IOTENDPOINT="
+          - !GetAtt IotEndpoint.iotEndpoint
+          - " VUE_APP_AWSREGION="
+          - !Ref AWS::Region
+          - " VUE_APP_SNSTOPIC="
+          - !Sub ${prefix}/sns
+          - " npm run build\n"
+          - "artifacts:\n"
+          - "  files:\n"
+          - "    - '**/*'\n"
+          - "  base-directory: dist\n"
+          - "cache:\n"
+          - "  paths:\n"
+          - "    - node_modules/**/*"
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        ComputeType: BUILD_GENERAL1_SMALL
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      TimeoutInMinutes: 10
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${prefix}-CodePipelineServiceRole
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  CodePipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${prefix}-CodePipelinePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - iam:PassRole
+            Resource: "*"
+            Effect: Allow
+            Condition:
+              StringEqualsIfExists:
+                iam:PassedToService:
+                - cloudformation.amazonaws.com
+                - elasticbeanstalk.amazonaws.com
+                - ec2.amazonaws.com
+                - ecs-tasks.amazonaws.com
+          - Action:
+            - codecommit:CancelUploadArchive
+            - codecommit:GetBranch
+            - codecommit:GetCommit
+            - codecommit:GetRepository
+            - codecommit:GetUploadArchiveStatus
+            - codecommit:UploadArchive
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - codedeploy:CreateDeployment
+            - codedeploy:GetApplication
+            - codedeploy:GetApplicationRevision
+            - codedeploy:GetDeployment
+            - codedeploy:GetDeploymentConfig
+            - codedeploy:RegisterApplicationRevision
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - codestar-connections:UseConnection
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - elasticbeanstalk:*
+            - ec2:*
+            - elasticloadbalancing:*
+            - autoscaling:*
+            - cloudwatch:*
+            - s3:*
+            - sns:*
+            - cloudformation:*
+            - rds:*
+            - sqs:*
+            - ecs:*
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - lambda:InvokeFunction
+            - lambda:ListFunctions
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - opsworks:CreateDeployment
+            - opsworks:DescribeApps
+            - opsworks:DescribeCommands
+            - opsworks:DescribeDeployments
+            - opsworks:DescribeInstances
+            - opsworks:DescribeStacks
+            - opsworks:UpdateApp
+            - opsworks:UpdateStack
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - cloudformation:CreateStack
+            - cloudformation:DeleteStack
+            - cloudformation:DescribeStacks
+            - cloudformation:UpdateStack
+            - cloudformation:CreateChangeSet
+            - cloudformation:DeleteChangeSet
+            - cloudformation:DescribeChangeSet
+            - cloudformation:ExecuteChangeSet
+            - cloudformation:SetStackPolicy
+            - cloudformation:ValidateTemplate
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - codebuild:BatchGetBuilds
+            - codebuild:StartBuild
+            - codebuild:BatchGetBuildBatches
+            - codebuild:StartBuildBatch
+            Resource: "*"
+            Effect: Allow
+          - Effect: Allow
+            Action:
+            - devicefarm:ListProjects
+            - devicefarm:ListDevicePools
+            - devicefarm:GetRun
+            - devicefarm:GetUpload
+            - devicefarm:CreateUpload
+            - devicefarm:ScheduleRun
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - servicecatalog:ListProvisioningArtifacts
+            - servicecatalog:CreateProvisioningArtifact
+            - servicecatalog:DescribeProvisioningArtifact
+            - servicecatalog:DeleteProvisioningArtifact
+            - servicecatalog:UpdateProduct
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - cloudformation:ValidateTemplate
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ecr:DescribeImages
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - states:DescribeExecution
+            - states:DescribeStateMachine
+            - states:StartExecution
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - appconfig:StartDeployment
+            - appconfig:StopDeployment
+            - appconfig:GetDeployment
+            Resource: "*"
+      Roles:
+        - !Ref CodePipelineServiceRole
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${prefix}-CodePipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref S3CodePipeline
+      Stages:
+        - Name: Source
+          Actions:
+          - ActionTypeId:
+              Category: Source
+              Owner: AWS
+              Provider: S3
+              Version: "1"
+            OutputArtifacts:
+              - Name: Stage1
+            Configuration:
+              S3Bucket: !Ref S3SourceBucket
+              S3ObjectKey: !Ref S3SourceKey
+            RunOrder: 1
+            Name: Source
+        - Name: Build
+          Actions:
+          - ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Provider: CodeBuild
+              Version: "1"
+            InputArtifacts:
+              - Name: Stage1
+            OutputArtifacts:
+              - Name: Stage2
+            Configuration:
+              ProjectName: !Ref CodeBuildProject
+              PrimarySource: Stage1
+            RunOrder: 1
+            Name: Build
+        - Name: Deploy
+          Actions:
+          - ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: S3
+              Version: "1"
+            InputArtifacts:
+              - Name: Stage2
+            Configuration:
+              BucketName: !Ref S3Webpage
+              ObjectKey: webpage
+              Extract: True
+            RunOrder: 1
+            Name: Deploy
+
+  LambdaSNS2IOT:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          iotClient = boto3.client('iot-data')
+          topic=os.environ["IOT_TOPIC"]
+          qos=0
+
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event, indent=2))
+              message = event['Records'][0]['Sns']['Message']
+              messageId = event['Records'][0]['Sns']['MessageId']
+              timestamp = event['Records'][0]['Sns']['Timestamp']
+              print("From SNS: " + message)
+              iotClient.publish(topic=topic, qos=qos, payload=json.dumps({"message": message, "messageId": messageId, "timestamp": timestamp}))
+
+              return message
+      Environment:
+        Variables:
+          IOT_TOPIC: !Sub ${prefix}/sns
+      Handler: "index.lambda_handler"
+      Runtime: python3.7
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  SubscriptionSNS2IOT:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt LambdaSNS2IOT.Arn
+      TopicArn: !Ref SNSTopic
+
+  SNSLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      Principal: sns.amazonaws.com
+      FunctionName: !GetAtt LambdaSNS2IOT.Arn
+      SourceArn: !Ref SNSTopic
+
+Outputs:
+  Webpage:
+    Value: !Join ["", ["http://", !GetAtt CFDistribution.DomainName, "/index.html"]]
